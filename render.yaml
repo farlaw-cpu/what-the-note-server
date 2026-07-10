@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: what-the-note-api
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: pnpm install --frozen-lockfile
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    domains:
+      - api.whatstheweather.tv
+    envVars:
+      - key: ALLOWED_WORKSPACE_DOMAIN
+        value: whatstheweather.tv
+      - key: APP_CALLBACK_URL
+        value: whatthenote://auth/callback
+      - key: PUBLIC_BASE_URL
+        value: https://api.whatstheweather.tv
+      - key: OPENAI_TRANSCRIPTION_MODEL
+        value: gpt-4o-transcribe
+      - key: OPENAI_SUBTITLE_TRANSCRIPTION_MODEL
+        value: whisper-1
+      - key: OPENAI_SUMMARY_MODEL
+        value: gpt-4.1-mini
+      - key: TRANSCRIPTION_MINUTES_LIMIT
+        value: "1000"
+      - key: SUBTITLE_PROJECTS_LIMIT
+        value: "200"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
