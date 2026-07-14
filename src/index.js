@@ -147,7 +147,12 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
     });
   } catch (error) {
     console.error("[transcribe]", error);
-    const message = describeOpenAIError(error);
+    const message = describeOpenAIError(error, {
+      model: process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe",
+      uploadBytes: req.file?.size,
+      uploadMimeType: req.file?.mimetype,
+      uploadOriginalName: req.file?.originalname
+    });
     if (message.includes("maximum") || message.includes("larger than") || message.includes("file size")) {
       return res.status(413).json({ message: "전사 파일이 너무 큽니다. 앱에서 더 작게 압축한 뒤 다시 시도해 주세요." });
     }
@@ -483,8 +488,12 @@ async function tryTranscription({ filePath, language, model }) {
   });
 }
 
-function describeOpenAIError(error) {
+function describeOpenAIError(error, context = {}) {
   const parts = [
+    context.model ? `model=${context.model}` : "",
+    context.uploadOriginalName ? `file=${context.uploadOriginalName}` : "",
+    context.uploadMimeType ? `mime=${context.uploadMimeType}` : "",
+    context.uploadBytes ? `upload=${formatBytes(context.uploadBytes)}` : "",
     error?.name ? `name=${error.name}` : "",
     error?.status ? `status=${error.status}` : "",
     error?.code ? `code=${error.code}` : "",
@@ -493,7 +502,28 @@ function describeOpenAIError(error) {
     error?.request_id ? `request_id=${error.request_id}` : "",
     error?.message ? String(error.message) : ""
   ].filter(Boolean);
-  return parts.join(" / ") || "알 수 없는 오류";
+  const detail = safeErrorDetails(error);
+  if (detail) parts.push(`detail=${detail}`);
+  return parts.join("\n") || "알 수 없는 오류";
+}
+
+function safeErrorDetails(error) {
+  const nested = error?.error;
+  if (!nested || typeof nested !== "object") return "";
+  const detail = {
+    message: nested.message,
+    type: nested.type,
+    code: nested.code,
+    param: nested.param
+  };
+  const text = JSON.stringify(Object.fromEntries(Object.entries(detail).filter(([, value]) => value)));
+  return text && text !== "{}" ? text : "";
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return `${(value / 1024 / 1024).toFixed(1)}MB`;
 }
 
 function buildSRT(segments, textField) {
