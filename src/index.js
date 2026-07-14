@@ -133,11 +133,13 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
       return res.status(400).json({ message: "전사할 파일을 찾지 못했습니다." });
     }
 
-    const result = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(filePath),
-      model: process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe",
+    const primaryModel = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe";
+    const fallbackModel = process.env.OPENAI_TRANSCRIPTION_FALLBACK_MODEL || "whisper-1";
+    const result = await transcribeAudioWithFallback({
+      filePath,
       language: req.body.language || "ko",
-      response_format: "json"
+      primaryModel,
+      fallbackModel
     });
 
     incrementUsage(req.user.email, { transcriptionMinutesUsed: 1 });
@@ -147,7 +149,7 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
     });
   } catch (error) {
     console.error("[transcribe]", error);
-    const message = String(error?.message || "");
+    const message = describeError(error);
     if (message.includes("maximum") || message.includes("larger than") || message.includes("file size")) {
       return res.status(413).json({ message: "전사 파일이 너무 큽니다. 앱에서 더 작게 압축한 뒤 다시 시도해 주세요." });
     }
@@ -472,6 +474,45 @@ function normalizeTranscriptionSegments(segments) {
     text: String(segment.text || "").trim(),
     translatedText: ""
   })).filter((segment) => segment.text && segment.endTime > segment.startTime);
+}
+
+async function transcribeAudioWithFallback({ filePath, language, primaryModel, fallbackModel }) {
+  const firstError = await tryTranscription({ filePath, language, model: primaryModel })
+    .then((result) => ({ result }))
+    .catch((error) => ({ error }));
+  if (firstError.result) return firstError.result;
+
+  if (!fallbackModel || fallbackModel === primaryModel) {
+    throw firstError.error;
+  }
+
+  const secondError = await tryTranscription({ filePath, language, model: fallbackModel })
+    .then((result) => ({ result }))
+    .catch((error) => ({ error }));
+  if (secondError.result) return secondError.result;
+
+  const primaryMessage = describeError(firstError.error);
+  const fallbackMessage = describeError(secondError.error);
+  throw new Error(`기본 전사 모델(${primaryModel}) 실패: ${primaryMessage}\n예비 전사 모델(${fallbackModel}) 실패: ${fallbackMessage}`);
+}
+
+async function tryTranscription({ filePath, language, model }) {
+  return openai.audio.transcriptions.create({
+    file: fs.createReadStream(filePath),
+    model,
+    language,
+    response_format: "json"
+  });
+}
+
+function describeError(error) {
+  const parts = [
+    error?.status ? `status=${error.status}` : "",
+    error?.code ? `code=${error.code}` : "",
+    error?.type ? `type=${error.type}` : "",
+    error?.message ? String(error.message) : ""
+  ].filter(Boolean);
+  return parts.join(" / ") || "알 수 없는 오류";
 }
 
 function buildSRT(segments, textField) {
