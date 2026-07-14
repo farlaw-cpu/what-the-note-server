@@ -147,7 +147,11 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
     });
   } catch (error) {
     console.error("[transcribe]", error);
-    res.status(500).json({ message: "전사 처리에 실패했습니다." });
+    const message = String(error?.message || "");
+    if (message.includes("maximum") || message.includes("larger than") || message.includes("file size")) {
+      return res.status(413).json({ message: "전사 파일이 너무 큽니다. 앱에서 더 작게 압축한 뒤 다시 시도해 주세요." });
+    }
+    res.status(500).json({ message: message ? `전사 처리에 실패했습니다. ${message}` : "전사 처리에 실패했습니다." });
   } finally {
     cleanupUpload(req.file?.path);
   }
