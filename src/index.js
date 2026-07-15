@@ -135,7 +135,7 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
       return res.status(400).json({ message: "전사할 파일을 찾지 못했습니다." });
     }
 
-    const model = process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe";
+    const model = process.env.OPENAI_DIARIZATION_MODEL || "gpt-4o-transcribe-diarize";
     const result = await tryTranscription({
       filePath,
       language: req.body.language || "ko",
@@ -147,12 +147,13 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
     recordTranscriptionUsage(req.user.email, result, model, req.file);
     res.json({
       transcriptText: result.text || "",
-      segments: []
+      segments: [],
+      speakerLabels: uniqueSpeakerLabels(result.segments)
     });
   } catch (error) {
     console.error("[transcribe]", error);
     const message = describeOpenAIError(error, {
-      model: process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe",
+      model: process.env.OPENAI_DIARIZATION_MODEL || "gpt-4o-transcribe-diarize",
       uploadBytes: req.file?.size,
       uploadMimeType: req.file?.mimetype,
       uploadOriginalName: req.file?.originalname
@@ -246,6 +247,89 @@ app.post("/term-candidates", requireSession, async (req, res) => {
   } catch (error) {
     console.error("[term-candidates]", error);
     res.status(500).json({ message: "AI 용어 후보 찾기에 실패했습니다." });
+  }
+});
+
+app.post("/speaker-insight", requireSession, async (req, res) => {
+  try {
+    const transcriptText = String(req.body.transcriptText || "").trim();
+    const diarizedSpeakerCount = Math.max(0, Math.min(20, Number(req.body.diarizedSpeakerCount || 0)));
+    if (!transcriptText) {
+      return res.json({ estimatedCount: 0, names: [], confidenceText: "전사문이 없습니다." });
+    }
+
+    const model = process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini";
+    const completion = await openai.chat.completions.create({
+      model,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: "Estimate the actual meeting speakers from a Korean transcript. Treat diarizedSpeakerCount as the strongest count signal. Include a person's real name only when the transcript or title strongly identifies that person as a speaker; never treat a merely mentioned person as a speaker. Use generic Korean labels such as 화자 1 when names are uncertain. Return strict JSON."
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            title: String(req.body.title || ""),
+            transcriptText,
+            diarizedSpeakerCount,
+            schema: {
+              estimatedCount: "integer",
+              names: ["string"],
+              confidenceText: "short Korean explanation"
+            }
+          })
+        }
+      ]
+    });
+    recordCompletionUsage(req.user.email, completion, model);
+    const parsed = parseJSON(completion.choices[0]?.message?.content);
+    res.json(normalizeSpeakerInsight(parsed, diarizedSpeakerCount));
+  } catch (error) {
+    console.error("[speaker insight]", error);
+    res.status(500).json({ message: "화자 정보를 추정하지 못했습니다." });
+  }
+});
+
+app.post("/notes/chat", requireSession, async (req, res) => {
+  try {
+    const questionNumber = Number(req.body.questionNumber || 0);
+    if (!Number.isInteger(questionNumber) || questionNumber < 1 || questionNumber > 4) {
+      return res.status(429).json({ message: "이 전사문에서는 질문을 4번까지 할 수 있습니다." });
+    }
+    const transcriptText = String(req.body.transcriptText || "").trim();
+    const question = String(req.body.question || "").trim();
+    if (!transcriptText || !question) {
+      return res.status(400).json({ message: "전사문과 질문을 확인해 주세요." });
+    }
+
+    const model = process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini";
+    const history = normalizeChatHistory(req.body.history).slice(-6);
+    const completion = await openai.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "system",
+          content: "Answer in Korean using only the supplied meeting transcript and summary. If the answer is not present, clearly say it cannot be confirmed from the transcript. Be concise and do not invent facts."
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            title: String(req.body.title || ""),
+            transcriptText,
+            summaryText: String(req.body.summaryText || "")
+          })
+        },
+        ...history.map((turn) => ({ role: turn.role, content: turn.text })),
+        { role: "user", content: question }
+      ]
+    });
+    recordCompletionUsage(req.user.email, completion, model);
+    const answer = String(completion.choices[0]?.message?.content || "").trim();
+    res.json({ answer: answer || "전사문에서 답을 확인하지 못했습니다." });
+  } catch (error) {
+    console.error("[notes chat]", error);
+    res.status(500).json({ message: "전사문 질문에 답하지 못했습니다." });
   }
 });
 
@@ -493,6 +577,7 @@ function normalizeTranscriptionSegments(segments) {
 }
 
 async function tryTranscription({ filePath, language, model, originalName, mimeType }) {
+  const isDiarization = String(model).includes("diarize");
   return openai.audio.transcriptions.create({
     file: await toFile(
       fs.createReadStream(filePath),
@@ -501,8 +586,46 @@ async function tryTranscription({ filePath, language, model, originalName, mimeT
     ),
     model,
     language,
-    response_format: "json"
+    response_format: isDiarization ? "diarized_json" : "json",
+    ...(isDiarization ? { chunking_strategy: "auto" } : {})
   });
+}
+
+function uniqueSpeakerLabels(segments) {
+  if (!Array.isArray(segments)) return [];
+  return [...new Set(segments
+    .map((segment) => String(segment?.speaker || "").trim())
+    .filter(Boolean))];
+}
+
+function normalizeSpeakerInsight(value, diarizedSpeakerCount) {
+  const rawNames = Array.isArray(value?.names) ? value.names : [];
+  const names = [...new Set(rawNames.map((name) => String(name || "").trim()).filter(Boolean))];
+  const aiCount = Number(value?.estimatedCount || 0);
+  const estimatedCount = Math.max(
+    diarizedSpeakerCount,
+    Number.isFinite(aiCount) ? Math.min(20, Math.max(0, Math.round(aiCount))) : 0,
+    names.length
+  );
+  const completedNames = names.slice(0, estimatedCount);
+  while (completedNames.length < estimatedCount) {
+    completedNames.push(`화자 ${completedNames.length + 1}`);
+  }
+  return {
+    estimatedCount,
+    names: completedNames,
+    confidenceText: String(value?.confidenceText || "음성 구간과 전사 내용을 기준으로 추정했습니다.")
+  };
+}
+
+function normalizeChatHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .map((turn) => ({
+      role: turn?.role === "assistant" ? "assistant" : "user",
+      text: String(turn?.text || "").trim()
+    }))
+    .filter((turn) => turn.text);
 }
 
 async function openAIUploadFile(file) {
