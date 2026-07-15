@@ -9,7 +9,7 @@ import { OAuth2Client } from "google-auth-library";
 import helmet from "helmet";
 import jwt from "jsonwebtoken";
 import multer from "multer";
-import OpenAI from "openai";
+import OpenAI, { toFile } from "openai";
 
 const {
   ALLOWED_WORKSPACE_DOMAIN = "whatstheweather.tv",
@@ -139,7 +139,9 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
     const result = await tryTranscription({
       filePath,
       language: req.body.language || "ko",
-      model
+      model,
+      originalName: req.file?.originalname,
+      mimeType: req.file?.mimetype
     });
 
     recordTranscriptionUsage(req.user.email, result, model, req.file);
@@ -262,7 +264,7 @@ app.post("/subtitle/generate", requireSession, upload.single("file"), async (req
     const sourceLanguage = String(req.body.sourceLanguage || "ko");
     const sceneCuts = parseJSONArray(req.body.sceneCuts);
     const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(filePath),
+      file: await openAIUploadFile(req.file),
       model: process.env.OPENAI_SUBTITLE_TRANSCRIPTION_MODEL || "whisper-1",
       language: sourceLanguage,
       response_format: "verbose_json",
@@ -486,13 +488,43 @@ function normalizeTranscriptionSegments(segments) {
   })).filter((segment) => segment.text && segment.endTime > segment.startTime);
 }
 
-async function tryTranscription({ filePath, language, model }) {
+async function tryTranscription({ filePath, language, model, originalName, mimeType }) {
   return openai.audio.transcriptions.create({
-    file: fs.createReadStream(filePath),
+    file: await toFile(
+      fs.createReadStream(filePath),
+      originalName || "upload_audio.m4a",
+      { type: supportedAudioMimeType(originalName, mimeType) }
+    ),
     model,
     language,
     response_format: "json"
   });
+}
+
+async function openAIUploadFile(file) {
+  if (!file?.path) throw new Error("업로드 파일을 찾지 못했습니다.");
+  return toFile(
+    fs.createReadStream(file.path),
+    file.originalname || "upload_audio.m4a",
+    { type: supportedAudioMimeType(file.originalname, file.mimetype) }
+  );
+}
+
+function supportedAudioMimeType(originalName, uploadedMimeType) {
+  const extension = path.extname(String(originalName || "")).toLowerCase();
+  const byExtension = {
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".oga": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm"
+  };
+  return byExtension[extension] || uploadedMimeType || "application/octet-stream";
 }
 
 function describeOpenAIError(error, context = {}) {
