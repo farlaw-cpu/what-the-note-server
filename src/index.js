@@ -213,7 +213,7 @@ app.post("/term-candidates", requireSession, async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "Find only proper nouns, names, brands, projects, acronyms, and suspicious transcription terms. Exclude everyday filler words. Return strict JSON."
+          content: "Find only proper nouns, names, brands, projects, acronyms, and suspicious transcription terms in Korean transcripts. Exclude everyday filler words. targetText must always be the corrected Korean Hangul spelling used in the transcript. If an official name is written in Latin letters, put that Latin spelling in note, never in targetText. confirmedSourceText must be the exact Korean source phrase that supports the correction. Return strict JSON."
         },
         {
           role: "user",
