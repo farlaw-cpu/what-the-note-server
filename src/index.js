@@ -170,19 +170,23 @@ app.post("/summarize", requireSession, async (req, res) => {
   try {
     const transcriptText = String(req.body.transcriptText || "");
     const terms = req.body.terms || [];
+    const currentDate = String(req.body.currentDate || new Date().toISOString().slice(0, 10));
+    const timeZone = String(req.body.timeZone || "Asia/Seoul");
     const completion = await openai.chat.completions.create({
       model: process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini",
       response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
-          content: "You turn Korean meeting transcripts into concise notes, action items, and execution checklists. Return strict JSON."
+          content: "You turn Korean meeting transcripts into concise notes, action items, and execution checklists. Resolve relative dates using the supplied currentDate and timeZone. Never invent an old year such as 2023 for a future task. Use a past year only when the transcript explicitly refers to that past date. Return strict JSON."
         },
         {
           role: "user",
           content: JSON.stringify({
             transcriptText,
             confirmedTerms: terms,
+            currentDate,
+            timeZone,
             schema: {
               summary: "string",
               actionItems: [{ title: "string", owner: "string", dueDateText: "string", isDone: false }],
@@ -213,7 +217,7 @@ app.post("/term-candidates", requireSession, async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "Find only proper nouns, names, brands, projects, acronyms, and suspicious transcription terms in Korean transcripts. Exclude everyday filler words. targetText must always be the corrected Korean Hangul spelling used in the transcript. If an official name is written in Latin letters, put that Latin spelling in note, never in targetText. confirmedSourceText must be the exact Korean source phrase that supports the correction. Return strict JSON."
+          content: "Find only proper nouns, names, brands, projects, acronyms, and suspicious transcription terms in Korean transcripts. Exclude everyday filler words. original must be the exact expression found in the transcript. targetText is your predicted correction and must be Korean Hangul, never an English translation. Review existingTerms as a reusable glossary, but return a saved term only when it is relevant to this transcript. confirmedSourceText must be the exact source phrase that supports the correction. Return strict JSON."
         },
         {
           role: "user",
