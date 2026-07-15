@@ -119,6 +119,8 @@ app.post("/auth/google/verify", async (req, res) => {
 app.get("/usage/me", requireSession, (req, res) => {
   const usage = usageFor(req.user.email);
   res.json({
+    billingMonth: usage.billingMonth,
+    estimatedCostUSD: roundCurrency(usage.estimatedCostUSD),
     transcriptionMinutesUsed: usage.transcriptionMinutesUsed,
     transcriptionMinutesLimit: Number(process.env.TRANSCRIPTION_MINUTES_LIMIT || 1000),
     subtitleProjectsUsed: usage.subtitleProjectsUsed,
@@ -140,7 +142,7 @@ app.post("/transcribe", requireSession, upload.single("file"), async (req, res) 
       model
     });
 
-    incrementUsage(req.user.email, { transcriptionMinutesUsed: 1 });
+    recordTranscriptionUsage(req.user.email, result, model, req.file);
     res.json({
       transcriptText: result.text || "",
       segments: []
@@ -188,6 +190,7 @@ app.post("/summarize", requireSession, async (req, res) => {
         }
       ]
     });
+    recordCompletionUsage(req.user.email, completion, process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini");
     const parsed = parseJSON(completion.choices[0]?.message?.content);
     res.json({
       summary: parsed.summary || "",
@@ -231,6 +234,7 @@ app.post("/term-candidates", requireSession, async (req, res) => {
         }
       ]
     });
+    recordCompletionUsage(req.user.email, completion, process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini");
     const parsed = parseJSON(completion.choices[0]?.message?.content);
     res.json({ terms: normalizeTerms(parsed.terms) });
   } catch (error) {
@@ -264,6 +268,7 @@ app.post("/subtitle/generate", requireSession, upload.single("file"), async (req
       response_format: "verbose_json",
       timestamp_granularities: ["segment"]
     });
+    recordWhisperUsage(req.user.email, transcription, req.file);
     const transcriptSegments = normalizeTranscriptionSegments(transcription.segments);
 
     const completion = await openai.chat.completions.create({
@@ -288,6 +293,7 @@ app.post("/subtitle/generate", requireSession, upload.single("file"), async (req
         }
       ]
     });
+    recordCompletionUsage(req.user.email, completion, process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini");
     const parsed = parseJSON(completion.choices[0]?.message?.content);
     const segments = normalizeSubtitleSegments(parsed.segments).length
       ? normalizeSubtitleSegments(parsed.segments)
@@ -332,6 +338,7 @@ app.post("/subtitle/translate", requireSession, async (req, res) => {
         }
       ]
     });
+    recordCompletionUsage(req.user.email, completion, process.env.OPENAI_SUMMARY_MODEL || "gpt-4.1-mini");
     const parsed = parseJSON(completion.choices[0]?.message?.content);
     const segments = normalizeSubtitleSegments(parsed.segments);
     res.json({
@@ -548,8 +555,11 @@ function pad(value, width) {
 }
 
 function usageFor(email) {
-  if (!usageByUser.has(email)) {
+  const billingMonth = currentBillingMonth();
+  if (!usageByUser.has(email) || usageByUser.get(email).billingMonth !== billingMonth) {
     usageByUser.set(email, {
+      billingMonth,
+      estimatedCostUSD: 0,
       transcriptionMinutesUsed: 0,
       subtitleProjectsUsed: 0
     });
@@ -561,6 +571,92 @@ function incrementUsage(email, patch) {
   const usage = usageFor(email);
   usage.transcriptionMinutesUsed += patch.transcriptionMinutesUsed || 0;
   usage.subtitleProjectsUsed += patch.subtitleProjectsUsed || 0;
+  usage.estimatedCostUSD += patch.estimatedCostUSD || 0;
+}
+
+function recordTranscriptionUsage(email, result, model, file) {
+  const minutes = transcriptionMinutes(result, file);
+  const tokenCost = transcriptionTokenCost(result?.usage, model);
+  incrementUsage(email, {
+    transcriptionMinutesUsed: minutes,
+    estimatedCostUSD: tokenCost ?? minutes * 0.006
+  });
+}
+
+function recordWhisperUsage(email, result, file) {
+  const minutes = transcriptionMinutes(result, file);
+  incrementUsage(email, {
+    transcriptionMinutesUsed: minutes,
+    estimatedCostUSD: minutes * 0.006
+  });
+}
+
+function recordCompletionUsage(email, completion, model) {
+  const usage = completion?.usage;
+  if (!usage) return;
+
+  const pricing = completionPricing(model);
+  const inputTokens = Number(usage.prompt_tokens || usage.input_tokens || 0);
+  const outputTokens = Number(usage.completion_tokens || usage.output_tokens || 0);
+  const cachedTokens = Number(usage.prompt_tokens_details?.cached_tokens || usage.input_tokens_details?.cached_tokens || 0);
+  const regularInputTokens = Math.max(0, inputTokens - cachedTokens);
+  const cost = (
+    regularInputTokens * pricing.inputPerMillion +
+    cachedTokens * pricing.cachedInputPerMillion +
+    outputTokens * pricing.outputPerMillion
+  ) / 1_000_000;
+  incrementUsage(email, { estimatedCostUSD: cost });
+}
+
+function transcriptionTokenCost(usage, model) {
+  if (!usage) return null;
+  const inputTokens = Number(usage.input_tokens || usage.prompt_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || usage.completion_tokens || 0);
+  if (!inputTokens && !outputTokens) return null;
+
+  const mini = String(model).includes("mini");
+  const inputPerMillion = mini ? 1.25 : 2.5;
+  const outputPerMillion = mini ? 5 : 10;
+  return (inputTokens * inputPerMillion + outputTokens * outputPerMillion) / 1_000_000;
+}
+
+function transcriptionMinutes(result, file) {
+  const duration = Number(result?.duration || result?.usage?.seconds || 0);
+  if (Number.isFinite(duration) && duration > 0) return duration / 60;
+
+  const bytes = Number(file?.size || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return 0;
+  // The Mac app uploads 12 kbps AAC. This fallback is used only when the provider omits duration.
+  return bytes / 1500 / 60;
+}
+
+function completionPricing(model) {
+  const name = String(model || "").toLowerCase();
+  if (name.includes("gpt-4.1-mini")) {
+    return { inputPerMillion: 0.4, cachedInputPerMillion: 0.1, outputPerMillion: 1.6 };
+  }
+  if (name.includes("gpt-4o-mini")) {
+    return { inputPerMillion: 0.15, cachedInputPerMillion: 0.075, outputPerMillion: 0.6 };
+  }
+  if (name.includes("gpt-4.1")) {
+    return { inputPerMillion: 2, cachedInputPerMillion: 0.5, outputPerMillion: 8 };
+  }
+  return { inputPerMillion: 2.5, cachedInputPerMillion: 1.25, outputPerMillion: 10 };
+}
+
+function currentBillingMonth() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit"
+  }).formatToParts(new Date());
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  return `${year}-${month}`;
+}
+
+function roundCurrency(value) {
+  return Math.round(Number(value || 0) * 1_000_000) / 1_000_000;
 }
 
 function cleanupUpload(filePath) {
